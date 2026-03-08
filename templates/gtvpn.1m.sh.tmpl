@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CLI="__CLI_PATH__"
+export GTVPN_CLI_PATH="$CLI"
+exec "$CLI" menu

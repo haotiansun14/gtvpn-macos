@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+GTVPN_ROOT="${GTVPN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# shellcheck source=/dev/null
+source "$GTVPN_ROOT/lib/common.sh"
+load_config
+ensure_runtime_dirs
+require_config_value VPN_USER
+require_config_value PASSWORD_KEYCHAIN_ACCOUNT
+require_commands expect openconnect security osascript
+
+export SUDO_ASKPASS="$ASKPASS_SCRIPT_PATH"
+GTVPN_RUNTIME_USER="$(id -un)"
+export GTVPN_RUNTIME_USER
+# shellcheck disable=SC2153
+export \
+  GTVPN_USER="$VPN_USER" \
+  GTVPN_PORTAL="$VPN_PORTAL" \
+  GTVPN_PROTOCOL="$VPN_PROTOCOL" \
+  GTVPN_GATEWAY_LABEL="$VPN_GATEWAY_LABEL" \
+  GTVPN_OS="$VPN_OS" \
+  GTVPN_SERVERCERT="$VPN_SERVERCERT"
+export GTVPN_PASSWORD_KEYCHAIN_SERVICE="$PASSWORD_KEYCHAIN_SERVICE"
+export GTVPN_PASSWORD_KEYCHAIN_ACCOUNT="$PASSWORD_KEYCHAIN_ACCOUNT"
+export GTVPN_OPENCONNECT_RESOLVES="$OPENCONNECT_RESOLVES"
+export GTVPN_OPENCONNECT_EXTRA_ARGS="$OPENCONNECT_EXTRA_ARGS"
+export GTVPN_MFA_MODE="$MFA_MODE"
+export GTVPN_MFA_RESPONSES="$MFA_RESPONSES"
+export GTVPN_MFA_KEYCHAIN_SERVICE="$MFA_KEYCHAIN_SERVICE"
+export GTVPN_MFA_KEYCHAIN_ACCOUNT="$MFA_KEYCHAIN_ACCOUNT"
+export GTVPN_MFA_COMMAND="$MFA_COMMAND"
+export GTVPN_SCRIPT_PATH="$VPNC_SCRIPT_PATH"
+export GTVPN_PID_FILE="$OPENCONNECT_PID_FILE"
+export GTVPN_LOG_DIR="$LOG_DIR"
+
+control_log_line "password helper starting"
+exec "$(expect_bin)" "$CONNECT_EXPECT_PATH"

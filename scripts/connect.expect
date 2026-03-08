@@ -1,0 +1,179 @@
+#!/usr/bin/expect -f
+set timeout -1
+
+proc getenv_default {name default} {
+    global env
+    if {[info exists env($name)] && $env($name) ne ""} {
+        return $env($name)
+    }
+    return $default
+}
+
+proc split_words {value} {
+    if {$value eq ""} {
+        return [list]
+    }
+    return [regexp -all -inline {[^[:space:]]+} $value]
+}
+
+proc trim_value {value} {
+    regsub {^[[:space:]]+} $value {} value
+    regsub {[[:space:]]+$} $value {} value
+    return $value
+}
+
+proc prompt_hidden {prompt} {
+    global env
+    set askpass [getenv_default GTVPN_ROOT ""]
+    if {$askpass ne ""} {
+        set askpass "$askpass/scripts/askpass.sh"
+    } else {
+        set askpass [getenv_default SUDO_ASKPASS ""]
+    }
+    set value [exec $askpass $prompt]
+    return [trim_value $value]
+}
+
+proc fetch_mfa_tokens {} {
+    global env
+    set mode [getenv_default GTVPN_MFA_MODE "static"]
+
+    switch -- $mode {
+        static {
+            return [split_words [getenv_default GTVPN_MFA_RESPONSES "push1 push2 phone1 phone2"]]
+        }
+        keychain {
+            set service [getenv_default GTVPN_MFA_KEYCHAIN_SERVICE "gtvpn-mfa"]
+            set account [getenv_default GTVPN_MFA_KEYCHAIN_ACCOUNT ""]
+            if {$account eq ""} {
+                return [list]
+            }
+            set secret [exec /usr/bin/security find-generic-password -a $account -s $service -w]
+            return [split_words [trim_value $secret]]
+        }
+        command {
+            set command_text [getenv_default GTVPN_MFA_COMMAND ""]
+            if {$command_text eq ""} {
+                return [list]
+            }
+            set secret [exec /bin/bash -lc $command_text]
+            return [split_words [trim_value $secret]]
+        }
+        prompt {
+            return [list __PROMPT__]
+        }
+        none {
+            return [list ""]
+        }
+        default {
+            return [split_words [getenv_default GTVPN_MFA_RESPONSES "push1 push2 phone1 phone2"]]
+        }
+    }
+}
+
+set user [getenv_default GTVPN_USER ""]
+set portal [getenv_default GTVPN_PORTAL ""]
+set protocol [getenv_default GTVPN_PROTOCOL "gp"]
+set os_name [getenv_default GTVPN_OS "mac-intel"]
+set gw_label [getenv_default GTVPN_GATEWAY_LABEL ""]
+set root [getenv_default GTVPN_ROOT ""]
+set config_path [getenv_default GTVPN_CONFIG ""]
+set user_home [getenv_default GTVPN_USER_HOME ""]
+set runtime_user [getenv_default GTVPN_RUNTIME_USER ""]
+set log_dir [getenv_default GTVPN_LOG_DIR ""]
+set pid_file [getenv_default GTVPN_PID_FILE ""]
+set wrapper [getenv_default GTVPN_SCRIPT_PATH ""]
+set servercert [getenv_default GTVPN_SERVERCERT ""]
+set password_service [getenv_default GTVPN_PASSWORD_KEYCHAIN_SERVICE "gtvpn-openconnect"]
+set password_account [getenv_default GTVPN_PASSWORD_KEYCHAIN_ACCOUNT $user]
+set resolves [split_words [getenv_default GTVPN_OPENCONNECT_RESOLVES ""]]
+set extra_args [split_words [getenv_default GTVPN_OPENCONNECT_EXTRA_ARGS ""]]
+set mfa_mode [getenv_default GTVPN_MFA_MODE "static"]
+set mfa_tokens [fetch_mfa_tokens]
+set mfa_index 0
+set oc [exec /bin/bash -lc "command -v openconnect"]
+set pw [exec /usr/bin/security find-generic-password -a $password_account -s $password_service -w]
+
+set cmd [list sudo -A env "GTVPN_ROOT=$root" "GTVPN_CONFIG=$config_path" "GTVPN_USER_HOME=$user_home" "GTVPN_RUNTIME_USER=$runtime_user" "GTVPN_LOG_DIR=$log_dir" $oc]
+lappend cmd "--protocol=$protocol"
+lappend cmd "--user=$user"
+lappend cmd "--os=$os_name"
+if {$gw_label ne ""} {
+    lappend cmd "--authgroup=$gw_label"
+}
+if {$servercert ne ""} {
+    lappend cmd "--servercert=$servercert"
+}
+if {$pid_file ne ""} {
+    lappend cmd "--pid-file=$pid_file"
+}
+foreach resolve $resolves {
+    if {$resolve ne ""} {
+        lappend cmd "--resolve=$resolve"
+    }
+}
+foreach arg $extra_args {
+    if {$arg ne ""} {
+        lappend cmd $arg
+    }
+}
+lappend cmd "--script=$wrapper"
+lappend cmd $portal
+
+spawn {*}$cmd
+
+while {1} {
+    expect {
+        -nocase -re {username:} {
+            send -- "$user\r"
+            exp_continue
+        }
+        -nocase -re {password:} {
+            send -- "$pw\r"
+            set mfa_index 0
+            exp_continue
+        }
+        -nocase -re {challenge:.*} {
+            if {$mfa_mode eq "prompt"} {
+                set factor [prompt_hidden "Duo factor or passcode"]
+            } elseif {[llength $mfa_tokens] == 0} {
+                set factor ""
+            } else {
+                if {$mfa_index >= [llength $mfa_tokens]} {
+                    set mfa_index [expr {[llength $mfa_tokens] - 1}]
+                }
+                set factor [lindex $mfa_tokens $mfa_index]
+                if {$factor eq "__PROMPT__"} {
+                    set factor [prompt_hidden "Duo factor or passcode"]
+                }
+            }
+            send -- "$factor\r"
+            exp_continue
+        }
+        -re {Unexpected 512 result from server} {
+            if {[llength $mfa_tokens] > 0 && $mfa_index < ([llength $mfa_tokens] - 1)} {
+                incr mfa_index
+            }
+            exp_continue
+        }
+        -nocase -re {gateway:.*} {
+            if {$gw_label ne ""} {
+                send -- "$gw_label\r"
+            } else {
+                send -- "\r"
+            }
+            exp_continue
+        }
+        -re {ESP tunnel connected} {
+            break
+        }
+        -re {Failed to authenticate} {
+            exit 1
+        }
+        eof {
+            break
+        }
+    }
+}
+
+expect eof

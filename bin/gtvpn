@@ -1,0 +1,495 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+resolve_self() {
+  local source="$1"
+  local dir=""
+  while [[ -L "$source" ]]; do
+    dir="$(cd -P "$(dirname "$source")" && pwd)"
+    source="$(readlink "$source")"
+    [[ "$source" != /* ]] && source="$dir/$source"
+  done
+  printf '%s\n' "$(cd -P "$(dirname "$source")" && pwd)/$(basename "$source")"
+}
+
+SELF_PATH="$(resolve_self "$0")"
+GTVPN_ROOT="$(cd "$(dirname "$SELF_PATH")/.." && pwd)"
+# shellcheck source=/dev/null
+source "$GTVPN_ROOT/lib/common.sh"
+load_config
+ensure_runtime_dirs
+
+usage() {
+  cat <<USAGE
+Usage: gtvpn <command>
+
+Commands:
+  connect [--foreground]      Start the VPN
+  disconnect                  Stop the VPN
+  toggle                      Connect or disconnect based on current state
+  status                      Print current status
+  menu                        Print SwiftBar menu output
+  doctor                      Check dependencies and local setup
+  password set|clear          Store or remove the login password from Keychain
+  sudo-password set|clear     Store or remove the sudo password from Keychain
+  mfa set|clear               Store or remove an MFA response from Keychain
+  enable-autoreconnect        Enable reconnect attempts by the launch agent
+  disable-autoreconnect       Disable reconnect attempts by the launch agent
+  install-switchbar           Render the SwiftBar plugin into the configured directory
+  install-autoreconnect       Render and load the launch agent
+  uninstall-autoreconnect     Unload and remove the launch agent
+  run-autoreconnect           Internal helper for launchd
+USAGE
+}
+
+script_invocation_path() {
+  if [[ -n "${GTVPN_CLI_PATH:-}" ]]; then
+    printf '%s\n' "$GTVPN_CLI_PATH"
+  elif command -v gtvpn >/dev/null 2>&1; then
+    command -v gtvpn
+  else
+    printf '%s\n' "$SELF_PATH"
+  fi
+}
+
+start_helper() {
+  local helper="$1"
+  local foreground="$2"
+  local -a cmd
+  cmd=(
+    env
+    "GTVPN_ROOT=$GTVPN_ROOT"
+    "GTVPN_CONFIG=$GTVPN_CONFIG"
+    "GTVPN_USER_HOME=$(_gtvpn_runtime_home)"
+    "GTVPN_CLI_PATH=$(script_invocation_path)"
+    "$helper"
+  )
+
+  if [[ "$foreground" == "1" ]]; then
+    exec "${cmd[@]}"
+  fi
+
+  nohup "${cmd[@]}" >> "$OPENCONNECT_LOG" 2>&1 &
+  disown || true
+}
+
+require_base_setup() {
+  require_commands openconnect security osascript scutil networksetup
+  require_config_value VPN_USER
+}
+
+prepare_sudo() {
+  export SUDO_ASKPASS="$ASKPASS_SCRIPT_PATH"
+
+  if keychain_get "$SUDO_PASSWORD_KEYCHAIN_SERVICE" "$SUDO_PASSWORD_KEYCHAIN_ACCOUNT" >/dev/null 2>&1; then
+    if ! sudo -A -k -v >/dev/null 2>&1; then
+      fatal "Stored sudo password was rejected. Run 'gtvpn sudo-password clear' or 'gtvpn sudo-password set'."
+    fi
+  fi
+}
+
+cmd_connect() {
+  local foreground="0"
+  if [[ "${1:-}" == "--foreground" ]]; then
+    foreground="1"
+  elif [[ -n "${1:-}" ]]; then
+    fatal "Unknown connect option: $1"
+  fi
+
+  require_base_setup
+  prepare_sudo
+
+  case "$AUTH_MODE" in
+    password)
+      require_commands expect
+      if ! keychain_get "$PASSWORD_KEYCHAIN_SERVICE" "$PASSWORD_KEYCHAIN_ACCOUNT" >/dev/null 2>&1; then
+        fatal "No password stored in Keychain for service '$PASSWORD_KEYCHAIN_SERVICE' and account '$PASSWORD_KEYCHAIN_ACCOUNT'"
+      fi
+      ;;
+    browser)
+      :
+      ;;
+    *)
+      fatal "Unsupported AUTH_MODE '$AUTH_MODE' (expected 'password' or 'browser')"
+      ;;
+  esac
+
+  if is_connected; then
+    printf '%s' "$(status_text)"
+    return 0
+  fi
+
+  if is_connecting; then
+    printf 'GT VPN is already connecting\n'
+    return 0
+  fi
+
+  control_log_line "connect requested (auth_mode=$AUTH_MODE foreground=$foreground)"
+
+  if [[ "$AUTH_MODE" == "browser" ]]; then
+    start_helper "$CONNECT_BROWSER_PATH" "$foreground"
+  else
+    start_helper "$GTVPN_ROOT/scripts/connect-password.sh" "$foreground"
+  fi
+
+  if [[ "$foreground" == "0" ]]; then
+    printf 'Connecting GT VPN in background\n'
+  fi
+}
+
+stop_helper_processes() {
+  pkill -f "$CONNECT_EXPECT_PATH" >/dev/null 2>&1 || true
+  pkill -f "$GTVPN_ROOT/scripts/connect-password.sh" >/dev/null 2>&1 || true
+  pkill -f "$CONNECT_BROWSER_PATH" >/dev/null 2>&1 || true
+}
+
+wait_for_tracked_shutdown() {
+  local _attempt
+  for _attempt in {1..10}; do
+    if ! tracked_openconnect_pids >/dev/null 2>&1 && ! is_connecting; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+cmd_disconnect() {
+  require_commands osascript
+  local had_target="0"
+  local pid
+  prepare_sudo
+  control_log_line "disconnect requested"
+
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    had_target="1"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      /bin/kill "$pid" >/dev/null 2>&1 || sudo -A kill "$pid" >/dev/null 2>&1 || true
+    fi
+  done < <(tracked_openconnect_pids || true)
+
+  stop_helper_processes
+  if wait_for_tracked_shutdown; then
+    rm -f "$OPENCONNECT_PID_FILE"
+  fi
+  if [[ "$had_target" == "1" ]] && ! tracked_openconnect_pids >/dev/null 2>&1 && ! is_connecting; then
+    printf 'Disconnect signal sent\n'
+  elif [[ "$had_target" == "1" ]]; then
+    printf 'Disconnect requested, but a privileged VPN process is still running\n' >&2
+    return 1
+  else
+    printf 'No tracked GT VPN session was running\n'
+  fi
+}
+
+cmd_toggle() {
+  case "$(status_code)" in
+    connected|connecting)
+      cmd_disconnect
+      ;;
+    *)
+      cmd_connect
+      ;;
+  esac
+}
+
+cmd_status() {
+  printf '%s' "$(status_text)"
+}
+
+cmd_menu() {
+  local status details ifname ip cli
+  status="$(status_code)"
+  cli="$(script_invocation_path)"
+
+  case "$status" in
+    connected)
+      details="$(vpn_tunnel_details || true)"
+      ifname="${details%% *}"
+      ip="${details##* }"
+      printf '🟢 GT On (%s %s)\n' "$ifname" "$ip"
+      printf -- '---\n'
+      printf 'Disconnect | bash=%s param1=disconnect terminal=false refresh=true\n' "$cli"
+      ;;
+    connecting)
+      printf '🟡 GT Connecting...\n'
+      printf -- '---\n'
+      printf 'Disconnect | bash=%s param1=disconnect terminal=false refresh=true\n' "$cli"
+      ;;
+    *)
+      printf '🔴 GT Off\n'
+      printf -- '---\n'
+      printf 'Connect | bash=%s param1=connect terminal=false refresh=true\n' "$cli"
+      ;;
+  esac
+
+  printf -- '---\n'
+  if autoreconnect_enabled; then
+    printf 'Auto-Reconnect: ON\n'
+    printf 'Disable Auto-Reconnect | bash=%s param1=disable-autoreconnect terminal=false refresh=true\n' "$cli"
+  else
+    printf 'Auto-Reconnect: OFF\n'
+    printf 'Enable Auto-Reconnect | bash=%s param1=enable-autoreconnect terminal=false refresh=true\n' "$cli"
+  fi
+
+  printf -- '---\n'
+  printf 'Public IP | bash=/bin/bash param1=-lc param2=%q terminal=true refresh=false\n' 'curl -s https://ipinfo.io/json; echo; read -n 1 -s -r -p "Press any key..."'
+  printf 'Doctor | bash=%s param1=doctor terminal=true refresh=false\n' "$cli"
+  printf 'Tail VPN Log | bash=/bin/bash param1=-lc param2=%q terminal=true refresh=false\n' "tail -n 120 \"$OPENCONNECT_LOG\"; echo; read -n 1 -s -r -p \"Press any key...\""
+}
+
+print_check() {
+  local name="$1"
+  local result="$2"
+  printf '%-24s %s\n' "$name" "$result"
+}
+
+cmd_doctor() {
+  local cli plugin_status launchd_status password_status mfa_status sudo_status
+  cli="$(script_invocation_path)"
+
+  print_check "Config" "$GTVPN_CONFIG"
+  print_check "Auth mode" "$AUTH_MODE"
+  print_check "Status" "$(status_code)"
+  print_check "CLI" "$cli"
+  print_check "vpnc wrapper" "$VPNC_SCRIPT_PATH"
+  print_check "Pid file" "$OPENCONNECT_PID_FILE"
+  print_check "Portal" "$VPN_PORTAL"
+  print_check "Gateway label" "$VPN_GATEWAY_LABEL"
+  print_check "Tunnel routes" "$GT_NET_ROUTES"
+
+  for dep in openconnect expect security osascript scutil networksetup route netstat ifconfig; do
+    if command -v "$dep" >/dev/null 2>&1; then
+      print_check "$dep" "ok ($(command -v "$dep"))"
+    else
+      print_check "$dep" "missing"
+    fi
+  done
+
+  if [[ -n "$VPN_USER" ]]; then
+    print_check "VPN user" "$VPN_USER"
+  else
+    print_check "VPN user" "missing"
+  fi
+
+  if [[ "$AUTH_MODE" == "password" ]]; then
+    if keychain_get "$PASSWORD_KEYCHAIN_SERVICE" "$PASSWORD_KEYCHAIN_ACCOUNT" >/dev/null 2>&1; then
+      password_status="present"
+    else
+      password_status="missing"
+    fi
+    print_check "Password keychain" "$password_status ($PASSWORD_KEYCHAIN_SERVICE/$PASSWORD_KEYCHAIN_ACCOUNT)"
+  fi
+
+  if [[ "$MFA_MODE" == "keychain" ]]; then
+    if keychain_get "$MFA_KEYCHAIN_SERVICE" "$MFA_KEYCHAIN_ACCOUNT" >/dev/null 2>&1; then
+      mfa_status="present"
+    else
+      mfa_status="missing"
+    fi
+    print_check "MFA keychain" "$mfa_status ($MFA_KEYCHAIN_SERVICE/$MFA_KEYCHAIN_ACCOUNT)"
+  else
+    print_check "MFA mode" "$MFA_MODE"
+  fi
+
+  if keychain_get "$SUDO_PASSWORD_KEYCHAIN_SERVICE" "$SUDO_PASSWORD_KEYCHAIN_ACCOUNT" >/dev/null 2>&1; then
+    sudo_status="present"
+  else
+    sudo_status="missing"
+  fi
+  print_check "Sudo keychain" "$sudo_status ($SUDO_PASSWORD_KEYCHAIN_SERVICE/$SUDO_PASSWORD_KEYCHAIN_ACCOUNT)"
+
+  if [[ -x "$SWIFTBAR_PLUGIN_PATH" ]]; then
+    plugin_status="installed"
+  else
+    plugin_status="not installed"
+  fi
+  print_check "SwiftBar plugin" "$plugin_status ($SWIFTBAR_PLUGIN_PATH)"
+
+  if [[ -f "$LAUNCH_AGENT_PATH" ]]; then
+    launchd_status="installed"
+  else
+    launchd_status="not installed"
+  fi
+  print_check "LaunchAgent" "$launchd_status ($LAUNCH_AGENT_PATH)"
+}
+
+cmd_password() {
+  local action="${1:-}"
+  require_config_value PASSWORD_KEYCHAIN_ACCOUNT
+  case "$action" in
+    set)
+      local secret
+      secret="$(prompt_secret "VPN password")"
+      keychain_set "$PASSWORD_KEYCHAIN_SERVICE" "$PASSWORD_KEYCHAIN_ACCOUNT" "$secret"
+      printf 'Stored VPN password in Keychain (%s/%s)\n' "$PASSWORD_KEYCHAIN_SERVICE" "$PASSWORD_KEYCHAIN_ACCOUNT"
+      ;;
+    clear)
+      keychain_delete "$PASSWORD_KEYCHAIN_SERVICE" "$PASSWORD_KEYCHAIN_ACCOUNT"
+      printf 'Removed VPN password from Keychain (%s/%s)\n' "$PASSWORD_KEYCHAIN_SERVICE" "$PASSWORD_KEYCHAIN_ACCOUNT"
+      ;;
+    *)
+      fatal "Usage: gtvpn password set|clear"
+      ;;
+  esac
+}
+
+cmd_sudo_password() {
+  local action="${1:-}"
+  require_config_value SUDO_PASSWORD_KEYCHAIN_ACCOUNT
+  case "$action" in
+    set)
+      local secret
+      secret="$(prompt_secret "macOS admin password")"
+      keychain_set "$SUDO_PASSWORD_KEYCHAIN_SERVICE" "$SUDO_PASSWORD_KEYCHAIN_ACCOUNT" "$secret"
+      printf 'Stored sudo password in Keychain (%s/%s)\n' "$SUDO_PASSWORD_KEYCHAIN_SERVICE" "$SUDO_PASSWORD_KEYCHAIN_ACCOUNT"
+      ;;
+    clear)
+      keychain_delete "$SUDO_PASSWORD_KEYCHAIN_SERVICE" "$SUDO_PASSWORD_KEYCHAIN_ACCOUNT"
+      printf 'Removed sudo password from Keychain (%s/%s)\n' "$SUDO_PASSWORD_KEYCHAIN_SERVICE" "$SUDO_PASSWORD_KEYCHAIN_ACCOUNT"
+      ;;
+    *)
+      fatal "Usage: gtvpn sudo-password set|clear"
+      ;;
+  esac
+}
+
+cmd_mfa() {
+  local action="${1:-}"
+  require_config_value MFA_KEYCHAIN_ACCOUNT
+  case "$action" in
+    set)
+      local secret
+      secret="$(prompt_secret "MFA response or passcode")"
+      keychain_set "$MFA_KEYCHAIN_SERVICE" "$MFA_KEYCHAIN_ACCOUNT" "$secret"
+      printf 'Stored MFA value in Keychain (%s/%s)\n' "$MFA_KEYCHAIN_SERVICE" "$MFA_KEYCHAIN_ACCOUNT"
+      ;;
+    clear)
+      keychain_delete "$MFA_KEYCHAIN_SERVICE" "$MFA_KEYCHAIN_ACCOUNT"
+      printf 'Removed MFA value from Keychain (%s/%s)\n' "$MFA_KEYCHAIN_SERVICE" "$MFA_KEYCHAIN_ACCOUNT"
+      ;;
+    *)
+      fatal "Usage: gtvpn mfa set|clear"
+      ;;
+  esac
+}
+
+cmd_enable_autoreconnect() {
+  mkdir -p "$(dirname "$AUTORECONNECT_SENTINEL")"
+  : > "$AUTORECONNECT_SENTINEL"
+  printf 'Auto-reconnect enabled\n'
+}
+
+cmd_disable_autoreconnect() {
+  rm -f "$AUTORECONNECT_SENTINEL"
+  printf 'Auto-reconnect disabled\n'
+}
+
+cmd_install_switchbar() {
+  local cli template
+  cli="$(script_invocation_path)"
+  template="$GTVPN_ROOT/templates/gtvpn.1m.sh.tmpl"
+  mkdir -p "$SWIFTBAR_PLUGIN_DIR"
+  render_template "$template" "$SWIFTBAR_PLUGIN_PATH" "$cli" "$AUTORECONNECT_INTERVAL" "$LAUNCH_AGENT_LABEL" "$LOG_DIR"
+  chmod +x "$SWIFTBAR_PLUGIN_PATH"
+  printf 'Installed SwiftBar plugin at %s\n' "$SWIFTBAR_PLUGIN_PATH"
+}
+
+launch_agent_domain() {
+  printf 'gui/%s\n' "$(id -u)"
+}
+
+cmd_install_autoreconnect() {
+  local cli template domain
+  cli="$(script_invocation_path)"
+  template="$GTVPN_ROOT/templates/edu.gatech.gtvpn.autoreconnect.plist.tmpl"
+  domain="$(launch_agent_domain)"
+
+  mkdir -p "$(dirname "$LAUNCH_AGENT_PATH")"
+  render_template "$template" "$LAUNCH_AGENT_PATH" "$cli" "$AUTORECONNECT_INTERVAL" "$LAUNCH_AGENT_LABEL" "$LOG_DIR"
+
+  /bin/launchctl bootout "$domain" "$LAUNCH_AGENT_PATH" >/dev/null 2>&1 || true
+  /bin/launchctl bootstrap "$domain" "$LAUNCH_AGENT_PATH"
+  /bin/launchctl enable "$domain/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
+
+  printf 'Installed LaunchAgent at %s\n' "$LAUNCH_AGENT_PATH"
+}
+
+cmd_uninstall_autoreconnect() {
+  local domain
+  domain="$(launch_agent_domain)"
+  /bin/launchctl bootout "$domain" "$LAUNCH_AGENT_PATH" >/dev/null 2>&1 || true
+  rm -f "$LAUNCH_AGENT_PATH"
+  printf 'Removed LaunchAgent from %s\n' "$LAUNCH_AGENT_PATH"
+}
+
+cmd_run_autoreconnect() {
+  exec env \
+    "GTVPN_ROOT=$GTVPN_ROOT" \
+    "GTVPN_CONFIG=$GTVPN_CONFIG" \
+    "GTVPN_USER_HOME=$(_gtvpn_runtime_home)" \
+    "GTVPN_CLI_PATH=$(script_invocation_path)" \
+    "$AUTORECONNECT_SCRIPT_PATH"
+}
+
+main() {
+  local command="${1:-}"
+  shift || true
+
+  case "$command" in
+    connect)
+      cmd_connect "$@"
+      ;;
+    disconnect)
+      cmd_disconnect
+      ;;
+    toggle)
+      cmd_toggle
+      ;;
+    status)
+      cmd_status
+      ;;
+    menu)
+      cmd_menu
+      ;;
+    doctor)
+      cmd_doctor
+      ;;
+    password)
+      cmd_password "$@"
+      ;;
+    sudo-password)
+      cmd_sudo_password "$@"
+      ;;
+    mfa)
+      cmd_mfa "$@"
+      ;;
+    enable-autoreconnect)
+      cmd_enable_autoreconnect
+      ;;
+    disable-autoreconnect)
+      cmd_disable_autoreconnect
+      ;;
+    install-switchbar)
+      cmd_install_switchbar
+      ;;
+    install-autoreconnect)
+      cmd_install_autoreconnect
+      ;;
+    uninstall-autoreconnect)
+      cmd_uninstall_autoreconnect
+      ;;
+    run-autoreconnect)
+      cmd_run_autoreconnect
+      ;;
+    help|-h|--help|'')
+      usage
+      ;;
+    *)
+      fatal "Unknown command '$command'"
+      ;;
+  esac
+}
+
+main "$@"
